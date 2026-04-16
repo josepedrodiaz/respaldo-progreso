@@ -87,14 +87,17 @@ code{background:#000;padding:6px 8px;border-radius:3px;font-size:11px;word-break
   100%{background:transparent;box-shadow:0 0 0 0 transparent}
 }
 .card{position:relative;overflow:hidden}
-.card.reveal::before{
+.card::before{
   content:"";position:absolute;inset:0;
-  background:linear-gradient(110deg,transparent 30%,rgba(139,212,80,.18) 50%,transparent 70%);
-  animation:sweep 1.1s ease-out;pointer-events:none
+  background:linear-gradient(110deg,transparent 30%,rgba(139,212,80,.22) 50%,transparent 70%);
+  transform:translateX(-100%);
+  pointer-events:none;
+  opacity:0
 }
+.card.sweep::before{animation:sweep 1.1s ease-out}
 @keyframes sweep{
-  0%{transform:translateX(-100%)}
-  100%{transform:translateX(100%)}
+  0%{transform:translateX(-100%);opacity:1}
+  100%{transform:translateX(100%);opacity:0}
 }
 </style></head>
 <body>
@@ -128,38 +131,42 @@ function set(id,val,highlight){
   }
   el.dataset.val=val;
 }
-async function tick(reveal=false){
+function sweepAll(){
+  document.querySelectorAll('.card').forEach(c=>{
+    c.classList.remove('sweep');
+    void c.offsetWidth;
+    c.classList.add('sweep');
+  });
+}
+document.addEventListener('animationend',e=>{
+  if(e.animationName==='sweep') e.target.classList.remove('sweep');
+});
+async function tick(){
   try{
     const r=await fetch('/api',{cache:'no-store'});
     const d=await r.json();
     const gib=d.bytes/(1024**3);
     const pct=Math.min(gib/TOTAL*100,100);
-    set('pct',pct.toFixed(2)+'%',reveal);
-    set('sub',gib.toFixed(2)+' GiB de '+TOTAL.toFixed(0)+' GiB',reveal);
+    set('pct',pct.toFixed(2)+'%',true);
+    set('sub',gib.toFixed(2)+' GiB de '+TOTAL.toFixed(0)+' GiB',true);
     document.getElementById('fill').style.width=pct+'%';
     const svc=document.getElementById('svc');
     svc.className='v '+(d.service==='active'?'active':'inactive');
-    set('svc',d.service,reveal);
+    set('svc',d.service,true);
     document.getElementById('dot').className='dot '+(d.service==='active'?'on':'');
-    set('obj',(d.objects||0).toLocaleString(),reveal);
-    set('stats',d.last_stats||'—',reveal);
-    set('last',d.last_copied||'—',reveal);
+    set('obj',(d.objects||0).toLocaleString(),true);
+    set('stats',d.last_stats||'—',true);
+    set('last',d.last_copied||'—',true);
     document.getElementById('ts').textContent=new Date().toLocaleTimeString();
-    if(reveal){
-      document.querySelectorAll('.card').forEach(c=>{
-        c.classList.remove('reveal');
-        void c.offsetWidth;
-        c.classList.add('reveal');
-      });
-    }
+    sweepAll();
   }catch(e){
     document.getElementById('sub').textContent='Error al consultar';
   }
 }
-function start(reveal){
-  if(timer){ if(reveal) tick(true); return; }
-  tick(!!reveal);
-  timer=setInterval(()=>tick(false),10000);
+function start(){
+  if(timer) return;
+  tick();
+  timer=setInterval(tick,10000);
 }
 function stop(){
   if(!timer) return;
@@ -167,11 +174,11 @@ function stop(){
   timer=null;
 }
 document.addEventListener('visibilitychange',()=>{
-  document.hidden?stop():start(true);
+  document.hidden?stop():start();
 });
-window.addEventListener('focus',()=>start(true));
+window.addEventListener('focus',start);
 window.addEventListener('blur',stop);
-if(!document.hidden) start(false);
+if(!document.hidden) start();
 </script>
 </body></html>"""
 
