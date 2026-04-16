@@ -1,0 +1,13 @@
+[Unit]
+Description=Pagina web de progreso del respaldo
+After=network.target
+
+[Service]
+Type=simple
+User=pedro
+ExecStart=/usr/bin/python3 /home/pedro/progreso-server.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
