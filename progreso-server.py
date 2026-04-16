@@ -81,6 +81,21 @@ code{background:#000;padding:6px 8px;border-radius:3px;font-size:11px;word-break
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;background:#555}
 .dot.on{background:#8bd450;animation:blink 1.5s infinite}
 @keyframes blink{50%{opacity:.3}}
+.flash{animation:flash 1.2s ease-out}
+@keyframes flash{
+  0%{background:rgba(139,212,80,.35);box-shadow:0 0 0 3px rgba(139,212,80,.35);color:#fff}
+  100%{background:transparent;box-shadow:0 0 0 0 transparent}
+}
+.card{position:relative;overflow:hidden}
+.card.reveal::before{
+  content:"";position:absolute;inset:0;
+  background:linear-gradient(110deg,transparent 30%,rgba(139,212,80,.18) 50%,transparent 70%);
+  animation:sweep 1.1s ease-out;pointer-events:none
+}
+@keyframes sweep{
+  0%{transform:translateX(-100%)}
+  100%{transform:translateX(100%)}
+}
 </style></head>
 <body>
 <h1><span id="dot" class="dot"></span>Respaldo familia → Google Drive</h1>
@@ -101,31 +116,50 @@ code{background:#000;padding:6px 8px;border-radius:3px;font-size:11px;word-break
 <script>
 const TOTAL=888.0;
 let timer=null;
-async function tick(){
+let prev={};
+function set(id,val,highlight){
+  const el=document.getElementById(id);
+  const old=el.dataset.val;
+  el.textContent=val;
+  if(highlight && old!==undefined && old!==String(val)){
+    el.classList.remove('flash');
+    void el.offsetWidth;
+    el.classList.add('flash');
+  }
+  el.dataset.val=val;
+}
+async function tick(reveal=false){
   try{
     const r=await fetch('/api',{cache:'no-store'});
     const d=await r.json();
     const gib=d.bytes/(1024**3);
     const pct=Math.min(gib/TOTAL*100,100);
-    document.getElementById('pct').textContent=pct.toFixed(2)+'%';
-    document.getElementById('sub').textContent=gib.toFixed(2)+' GiB de '+TOTAL.toFixed(0)+' GiB';
+    set('pct',pct.toFixed(2)+'%',reveal);
+    set('sub',gib.toFixed(2)+' GiB de '+TOTAL.toFixed(0)+' GiB',reveal);
     document.getElementById('fill').style.width=pct+'%';
     const svc=document.getElementById('svc');
-    svc.textContent=d.service;
     svc.className='v '+(d.service==='active'?'active':'inactive');
+    set('svc',d.service,reveal);
     document.getElementById('dot').className='dot '+(d.service==='active'?'on':'');
-    document.getElementById('obj').textContent=(d.objects||0).toLocaleString();
-    document.getElementById('stats').textContent=d.last_stats||'—';
-    document.getElementById('last').textContent=d.last_copied||'—';
+    set('obj',(d.objects||0).toLocaleString(),reveal);
+    set('stats',d.last_stats||'—',reveal);
+    set('last',d.last_copied||'—',reveal);
     document.getElementById('ts').textContent=new Date().toLocaleTimeString();
+    if(reveal){
+      document.querySelectorAll('.card').forEach(c=>{
+        c.classList.remove('reveal');
+        void c.offsetWidth;
+        c.classList.add('reveal');
+      });
+    }
   }catch(e){
     document.getElementById('sub').textContent='Error al consultar';
   }
 }
-function start(){
-  if(timer) return;
-  tick();
-  timer=setInterval(tick,10000);
+function start(reveal){
+  if(timer){ if(reveal) tick(true); return; }
+  tick(!!reveal);
+  timer=setInterval(()=>tick(false),10000);
 }
 function stop(){
   if(!timer) return;
@@ -133,11 +167,11 @@ function stop(){
   timer=null;
 }
 document.addEventListener('visibilitychange',()=>{
-  document.hidden?stop():start();
+  document.hidden?stop():start(true);
 });
-window.addEventListener('focus',start);
+window.addEventListener('focus',()=>start(true));
 window.addEventListener('blur',stop);
-if(!document.hidden) start();
+if(!document.hidden) start(false);
 </script>
 </body></html>"""
 
