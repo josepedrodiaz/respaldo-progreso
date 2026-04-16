@@ -100,6 +100,7 @@ code{background:#000;padding:6px 8px;border-radius:3px;font-size:11px;word-break
 <div class="foot">Actualizado <span id="ts">—</span></div>
 <script>
 const TOTAL=888.0;
+let timer=null;
 async function tick(){
   try{
     const r=await fetch('/api',{cache:'no-store'});
@@ -121,8 +122,22 @@ async function tick(){
     document.getElementById('sub').textContent='Error al consultar';
   }
 }
-tick();
-setInterval(tick,10000);
+function start(){
+  if(timer) return;
+  tick();
+  timer=setInterval(tick,10000);
+}
+function stop(){
+  if(!timer) return;
+  clearInterval(timer);
+  timer=null;
+}
+document.addEventListener('visibilitychange',()=>{
+  document.hidden?stop():start();
+});
+window.addEventListener('focus',start);
+window.addEventListener('blur',stop);
+if(!document.hidden) start();
 </script>
 </body></html>"""
 
