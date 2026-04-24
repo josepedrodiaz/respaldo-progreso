@@ -169,8 +169,14 @@ h2{font-size:14px;color:#888;margin:0 0 10px;text-transform:uppercase;letter-spa
   0%{transform:translateX(-100%);opacity:1}
   100%{transform:translateX(100%);opacity:0}
 }
+body.offline{opacity:.45;filter:grayscale(.8)}
+body.offline .card{border:1px solid #533}
+#offline{display:none;background:#6b1a1a;color:#fff;padding:12px 16px;border-radius:8px;margin-bottom:14px;font-size:14px;text-align:center;border:1px solid #e55;opacity:1;filter:none}
+body.offline #offline{display:block;animation:pulse 1.5s infinite;opacity:1;filter:none}
+@keyframes pulse{50%{background:#8b2323}}
 </style></head>
 <body>
+<div id="offline">⚠️ SIN CONEXIÓN al server · datos desactualizados <span id="stale">—</span></div>
 <h1><span id="dot" class="dot"></span>Respaldo familia → Google Drive</h1>
 <div class="card">
   <div class="big" id="pct">—</div>
@@ -206,7 +212,22 @@ h2{font-size:14px;color:#888;margin:0 0 10px;text-transform:uppercase;letter-spa
 <script>
 const TOTAL=888.0;
 let timer=null;
-let prev={};
+let staleTimer=null;
+let lastOk=Date.now();
+function fmtAge(ms){
+  const s=Math.floor(ms/1000);
+  if(s<60) return 'hace '+s+'s';
+  if(s<3600) return 'hace '+Math.floor(s/60)+'m '+(s%60)+'s';
+  return 'hace '+Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m';
+}
+function markOffline(){
+  document.body.classList.add('offline');
+  document.getElementById('stale').textContent=fmtAge(Date.now()-lastOk);
+}
+function markOnline(){
+  document.body.classList.remove('offline');
+  lastOk=Date.now();
+}
 function set(id,val,highlight){
   const el=document.getElementById(id);
   const old=el.dataset.val;
@@ -230,8 +251,13 @@ document.addEventListener('animationend',e=>{
 });
 async function tick(){
   try{
-    const r=await fetch('/api',{cache:'no-store'});
+    const ctrl=new AbortController();
+    const tout=setTimeout(()=>ctrl.abort(),8000);
+    const r=await fetch('/api',{cache:'no-store',signal:ctrl.signal});
+    clearTimeout(tout);
+    if(!r.ok) throw new Error('http '+r.status);
     const d=await r.json();
+    markOnline();
     const gib=d.bytes/(1024**3);
     const pct=Math.min(gib/TOTAL*100,100);
     set('pct',pct.toFixed(2)+'%',true);
@@ -262,18 +288,23 @@ async function tick(){
     document.getElementById('ts').textContent=new Date().toLocaleTimeString();
     sweepAll();
   }catch(e){
-    document.getElementById('sub').textContent='Error al consultar';
+    markOffline();
   }
 }
 function start(){
   if(timer) return;
   tick();
   timer=setInterval(tick,10000);
+  staleTimer=setInterval(()=>{
+    if(document.body.classList.contains('offline')){
+      document.getElementById('stale').textContent=fmtAge(Date.now()-lastOk);
+    }
+  },1000);
 }
 function stop(){
   if(!timer) return;
-  clearInterval(timer);
-  timer=null;
+  clearInterval(timer);timer=null;
+  clearInterval(staleTimer);staleTimer=null;
 }
 document.addEventListener('visibilitychange',()=>{
   document.hidden?stop():start();
