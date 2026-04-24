@@ -117,6 +117,27 @@ def loop():
             pass
         time.sleep(20)
 
+# Refresh inicial sincronico (rapido, sin rclone size) para que la pagina
+# tenga datos utiles desde el primer request. El refresh en background
+# va a llenar lo que falta (rclone size, journalctl).
+def quick_initial():
+    d = {}
+    d["objects"] = 0
+    d["bytes"] = 0
+    d["drive_reachable"] = False
+    d["service"] = svc_status("respaldo-fotos-familia")
+    d["watchdog"] = svc_status("wifi-watchdog")
+    d["disk_mounted"] = disk_mounted()
+    d["disk_present"] = disk_device_present()
+    d["net_ok"] = net_ok()
+    d["wifi_last_reset"] = ""
+    d["wifi_last_event"] = ""
+    for k in ("last_copied", "last_stats", "last_script", "last_error"):
+        d[k] = ""
+    CACHE["data"] = d
+    CACHE["ts"] = time.time()
+
+quick_initial()
 threading.Thread(target=loop, daemon=True).start()
 
 HTML = """<!DOCTYPE html>
@@ -258,7 +279,12 @@ async function tick(){
     if(!r.ok) throw new Error('http '+r.status);
     const d=await r.json();
     markOnline();
-    const gib=d.bytes/(1024**3);
+    if(!d || d.service===undefined){
+      // cache aun sin poblar
+      document.getElementById('sub').textContent='Cargando datos…';
+      return;
+    }
+    const gib=(d.bytes||0)/(1024**3);
     const pct=Math.min(gib/TOTAL*100,100);
     set('pct',pct.toFixed(2)+'%',true);
     set('sub',gib.toFixed(2)+' GiB de '+TOTAL.toFixed(0)+' GiB',true);
