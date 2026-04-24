@@ -1,0 +1,15 @@
+[Unit]
+Description=Watchdog de WiFi - resetea el dongle si no hay internet
+After=network-online.target
+
+[Service]
+Type=simple
+User=pedro
+ExecStart=/home/pedro/wifi-watchdog.sh
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

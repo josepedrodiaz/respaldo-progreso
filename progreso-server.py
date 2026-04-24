@@ -6,8 +6,49 @@ DEST = "gdrive-bisvidita:Respaldo DiazSantaM 2026-04-14"
 TOTAL_GIB = 888.0
 CACHE = {"ts": 0, "data": {}}
 
+SOURCE = "/media/pedro/DiazSantaM"
+
+def cmd(args, timeout=10):
+    try:
+        return subprocess.check_output(args, timeout=timeout, stderr=subprocess.DEVNULL).decode().strip()
+    except subprocess.CalledProcessError as e:
+        return (e.output.decode().strip() if e.output else "")
+    except Exception:
+        return ""
+
+def svc_status(name):
+    s = cmd(["systemctl", "is-active", name])
+    return s if s else "unknown"
+
+def disk_mounted():
+    try:
+        with open("/proc/mounts") as f:
+            return SOURCE in f.read()
+    except Exception:
+        return False
+
+def disk_device_present():
+    return os.path.exists("/dev/disk/by-label/DiazSantaM")
+
+def net_ok():
+    r = subprocess.run(["ping", "-c", "1", "-W", "3", "8.8.8.8"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return r.returncode == 0
+
+def wifi_watchdog_last():
+    out = cmd(["journalctl", "-u", "wifi-watchdog", "-n", "40", "--no-pager", "-o", "short-iso"], timeout=10)
+    last_reset = ""
+    last_event = ""
+    for ln in out.splitlines():
+        if "reseteando" in ln.lower():
+            last_reset = ln
+        if "fallo" in ln.lower() or "recuperada" in ln.lower():
+            last_event = ln
+    return last_reset, last_event
+
 def refresh():
     d = {}
+    # Drive size (lento, puede fallar si no hay red)
     try:
         out = subprocess.check_output(
             ["rclone", "size", DEST, "--json"],
@@ -16,17 +57,24 @@ def refresh():
         j = json.loads(out)
         d["objects"] = j.get("count", 0)
         d["bytes"] = j.get("bytes", 0)
+        d["drive_reachable"] = True
     except Exception:
         d["objects"] = CACHE["data"].get("objects", 0)
         d["bytes"] = CACHE["data"].get("bytes", 0)
-    try:
-        active = subprocess.check_output(
-            ["systemctl", "is-active", "respaldo-fotos-familia"],
-            stderr=subprocess.DEVNULL
-        ).decode().strip()
-    except subprocess.CalledProcessError as e:
-        active = e.output.decode().strip() if e.output else "unknown"
-    d["service"] = active
+        d["drive_reachable"] = False
+    # Estado de servicios
+    d["service"] = svc_status("respaldo-fotos-familia")
+    d["watchdog"] = svc_status("wifi-watchdog")
+    # Estado de disco
+    d["disk_mounted"] = disk_mounted()
+    d["disk_present"] = disk_device_present()
+    # Estado de red
+    d["net_ok"] = net_ok()
+    # Watchdog - ultimo evento
+    last_reset, last_event = wifi_watchdog_last()
+    d["wifi_last_reset"] = last_reset
+    d["wifi_last_event"] = last_event
+    # Log del respaldo - ultimo archivo, stats, ultimo mensaje relevante
     try:
         with open(LOG) as f:
             lines = f.readlines()
@@ -40,11 +88,24 @@ def refresh():
             if re.search(r"\d+ B/s|\d+\.\d+ [KMG]iB/s", ln):
                 stats = ln.strip()
                 break
+        last_script = ""
+        for ln in reversed(lines):
+            s = ln.strip()
+            if s.startswith("[") and "]" in s:
+                last_script = s
+                break
+        last_error = ""
+        for ln in reversed(lines[-300:]):
+            if re.search(r"\bERROR\b|CRITICAL|Failed", ln):
+                last_error = ln.strip()[-220:]
+                break
         d["last_copied"] = last_copied
         d["last_stats"] = stats
+        d["last_script"] = last_script
+        d["last_error"] = last_error
     except Exception:
-        d["last_copied"] = CACHE["data"].get("last_copied", "")
-        d["last_stats"] = CACHE["data"].get("last_stats", "")
+        for k in ("last_copied", "last_stats", "last_script", "last_error"):
+            d[k] = CACHE["data"].get(k, "")
     CACHE["data"] = d
     CACHE["ts"] = time.time()
 
@@ -80,7 +141,16 @@ code{background:#000;padding:6px 8px;border-radius:3px;font-size:11px;word-break
 .foot{color:#555;font-size:11px;text-align:center;margin-top:20px}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;background:#555}
 .dot.on{background:#8bd450;animation:blink 1.5s infinite}
+.dot.bad{background:#e55}
+.dot.warn{background:#f0a030}
 @keyframes blink{50%{opacity:.3}}
+.pill{display:inline-flex;align-items:center;gap:6px}
+.pill .dotmini{width:8px;height:8px;border-radius:50%;background:#555}
+.pill.ok .dotmini{background:#8bd450}
+.pill.bad .dotmini{background:#e55}
+.pill.ok{color:#8bd450}
+.pill.bad{color:#e55}
+h2{font-size:14px;color:#888;margin:0 0 10px;text-transform:uppercase;letter-spacing:.5px}
 .flash{animation:flash 1.2s ease-out}
 @keyframes flash{
   0%{background:rgba(139,212,80,.35);box-shadow:0 0 0 3px rgba(139,212,80,.35);color:#fff}
@@ -108,12 +178,29 @@ code{background:#000;padding:6px 8px;border-radius:3px;font-size:11px;word-break
   <div class="bar"><div class="fill" id="fill" style="width:0%"></div></div>
 </div>
 <div class="card">
-  <div class="row"><span class="k">Servicio</span><span class="v" id="svc">—</span></div>
-  <div class="row"><span class="k">Archivos</span><span class="v" id="obj">—</span></div>
-  <div class="row"><span class="k">Última stats</span></div>
+  <h2>Salud del sistema</h2>
+  <div class="row"><span class="k">Disco (DiazSantaM)</span><span class="v" id="disk">—</span></div>
+  <div class="row"><span class="k">Red (ping 8.8.8.8)</span><span class="v" id="net">—</span></div>
+  <div class="row"><span class="k">Google Drive</span><span class="v" id="drive">—</span></div>
+  <div class="row"><span class="k">Servicio backup</span><span class="v" id="svc">—</span></div>
+  <div class="row"><span class="k">Watchdog WiFi</span><span class="v" id="wd">—</span></div>
+</div>
+<div class="card">
+  <h2>Progreso</h2>
+  <div class="row"><span class="k">Archivos subidos</span><span class="v" id="obj">—</span></div>
+  <div class="row"><span class="k">Última stats rclone</span></div>
   <code id="stats">—</code>
-  <div class="row"><span class="k">Último archivo</span></div>
+  <div class="row"><span class="k">Último archivo copiado</span></div>
   <code id="last">—</code>
+</div>
+<div class="card">
+  <h2>Eventos</h2>
+  <div class="row"><span class="k">Último del script</span></div>
+  <code id="script">—</code>
+  <div class="row"><span class="k">Último error</span></div>
+  <code id="err">—</code>
+  <div class="row"><span class="k">Último reset WiFi</span></div>
+  <code id="wifireset">—</code>
 </div>
 <div class="foot">Actualizado <span id="ts">—</span></div>
 <script>
@@ -150,13 +237,28 @@ async function tick(){
     set('pct',pct.toFixed(2)+'%',true);
     set('sub',gib.toFixed(2)+' GiB de '+TOTAL.toFixed(0)+' GiB',true);
     document.getElementById('fill').style.width=pct+'%';
-    const svc=document.getElementById('svc');
-    svc.className='v '+(d.service==='active'?'active':'inactive');
-    set('svc',d.service,true);
-    document.getElementById('dot').className='dot '+(d.service==='active'?'on':'');
+    // Salud
+    function pill(id,ok,txt){
+      const el=document.getElementById(id);
+      el.className='v pill '+(ok?'ok':'bad');
+      el.innerHTML='<span class="dotmini"></span>'+txt;
+    }
+    pill('disk',d.disk_mounted,d.disk_mounted?'montado':(d.disk_present?'presente sin montar':'ausente'));
+    pill('net',d.net_ok,d.net_ok?'OK':'sin red');
+    pill('drive',d.drive_reachable,d.drive_reachable?'OK':'sin acceso');
+    pill('svc',d.service==='active',d.service);
+    pill('wd',d.watchdog==='active',d.watchdog);
+    // Dot del header: peor estado manda
+    const allGood=d.service==='active'&&d.disk_mounted&&d.net_ok;
+    const someBad=!d.disk_mounted||!d.net_ok||d.service==='failed';
+    const dot=document.getElementById('dot');
+    dot.className='dot '+(allGood?'on':(someBad?'bad':'warn'));
     set('obj',(d.objects||0).toLocaleString(),true);
     set('stats',d.last_stats||'—',true);
     set('last',d.last_copied||'—',true);
+    set('script',d.last_script||'—',true);
+    set('err',d.last_error||'sin errores recientes',true);
+    set('wifireset',d.wifi_last_reset||'sin resets',true);
     document.getElementById('ts').textContent=new Date().toLocaleTimeString();
     sweepAll();
   }catch(e){
