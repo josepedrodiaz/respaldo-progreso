@@ -44,11 +44,97 @@ def wifi_watchdog_last():
     last_reset = ""
     last_event = ""
     for ln in out.splitlines():
-        if "reseteando" in ln.lower():
+        if "reseteando" in ln.lower() or "lv1" in ln.lower() or "lv2" in ln.lower() or "lv3" in ln.lower() or "lv4" in ln.lower() or "REBOOT" in ln:
             last_reset = ln
         if "fallo" in ln.lower() or "recuperada" in ln.lower():
             last_event = ln
     return last_reset, last_event
+
+def parse_journal_events(unit, source_label, max_n=80):
+    """Lee journalctl con timestamp unix, devuelve [(epoch, source, severity, msg)]"""
+    out = cmd(["journalctl", "-u", unit, "-n", str(max_n), "--no-pager", "-o", "short-unix"], timeout=15)
+    events = []
+    for ln in out.splitlines():
+        # formato: "1745123456.789 host UNIT[pid]: mensaje"
+        m = re.match(r"^(\d+)(?:\.\d+)?\s+\S+\s+([^:]+):\s*(.*)$", ln)
+        if not m:
+            continue
+        epoch = int(m.group(1))
+        msg = m.group(3).strip()
+        # Limpieza: si el mensaje empieza con [HH:MM:SS], sacarlo (el epoch ya basta)
+        msg = re.sub(r"^\[\d{2}:\d{2}:\d{2}\]\s*", "", msg)
+        sev = "info"
+        ml = msg.lower()
+        if "error" in ml or "failed" in ml or "fallo" in ml:
+            sev = "error"
+        if "reboot" in ml.lower() or "lv4" in ml or "lv3" in ml:
+            sev = "warn"
+        if "lv1" in ml or "lv2" in ml or "reseteando" in ml:
+            sev = "warn"
+        if "recuperada" in ml or "OK" in msg or "arrancado" in ml:
+            sev = "ok"
+        if "Started" in msg or "Stopped" in msg or "Stopping" in msg:
+            sev = "info"
+        events.append((epoch, source_label, sev, msg[:240]))
+    return events
+
+def parse_rclone_log_events(max_n=60):
+    """Eventos relevantes del log de rclone: errores, retries, copied recientes."""
+    events = []
+    try:
+        with open(LOG) as f:
+            lines = f.readlines()
+    except Exception:
+        return events
+    # solo ultimas N lineas para no leer el archivo entero (puede ser MB)
+    for ln in lines[-2000:]:
+        ln = ln.rstrip()
+        # Lineas del script: "[YYYY-MM-DD HH:MM:SS] ..."
+        m1 = re.match(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s*(.*)$", ln)
+        if m1:
+            try:
+                t = int(time.mktime(time.strptime(m1.group(1), "%Y-%m-%d %H:%M:%S")))
+                msg = m1.group(2)[:240]
+                sev = "info"
+                if "ERROR" in msg or "rindiendome" in msg.lower():
+                    sev = "error"
+                elif "rclone termino OK" in msg:
+                    sev = "ok"
+                elif "intento" in msg.lower() or "esperando" in msg.lower() or "retry" in msg.lower():
+                    sev = "warn"
+                events.append((t, "script", sev, msg))
+            except Exception:
+                pass
+            continue
+        # Lineas de rclone: "YYYY/MM/DD HH:MM:SS LEVEL : mensaje"
+        m2 = re.match(r"^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\s+(\S+)\s*:\s*(.*)$", ln)
+        if m2:
+            try:
+                t = int(time.mktime(time.strptime(m2.group(1), "%Y/%m/%d %H:%M:%S")))
+                level = m2.group(2)
+                msg = m2.group(3)[:240]
+                # solo reportamos errores, retries, y arranques/finales (no cada Copied)
+                interesting = (level in ("ERROR", "CRITICAL")) or \
+                              "retry" in msg.lower() or "Failed" in msg or \
+                              "Attempt" in msg or "all retries" in msg.lower()
+                if not interesting:
+                    continue
+                sev = "error" if level in ("ERROR", "CRITICAL") or "Failed" in msg else "warn"
+                events.append((t, "rclone", sev, msg))
+            except Exception:
+                pass
+    return events[-max_n:]
+
+def collect_events(max_n=60):
+    all_e = []
+    all_e += parse_journal_events("wifi-watchdog", "watchdog", 80)
+    all_e += parse_journal_events("respaldo-fotos-familia", "backup", 80)
+    all_e += parse_rclone_log_events(80)
+    all_e.sort(key=lambda e: e[0], reverse=True)
+    out = []
+    for (t, src, sev, msg) in all_e[:max_n]:
+        out.append({"ts": t, "src": src, "sev": sev, "msg": msg})
+    return out
 
 def refresh():
     d = {}
@@ -122,6 +208,11 @@ def refresh():
     last_reset, last_event = wifi_watchdog_last()
     d["wifi_last_reset"] = last_reset
     d["wifi_last_event"] = last_event
+    # Timeline completo de eventos del sistema de proteccion
+    try:
+        d["events"] = collect_events(60)
+    except Exception:
+        d["events"] = CACHE["data"].get("events", [])
     # Log del respaldo - ultimo archivo, stats, ultimo mensaje relevante
     try:
         with open(LOG) as f:
@@ -185,6 +276,7 @@ def quick_initial():
     d["speed_total_bps"] = None
     d["eta_seconds"] = None
     d["files_per_hour"] = 0
+    d["events"] = []
     for k in ("last_copied", "last_stats", "last_script", "last_error"):
         d[k] = ""
     CACHE["data"] = d
@@ -231,6 +323,20 @@ h2{font-size:14px;color:#888;margin:0 0 10px;text-transform:uppercase;letter-spa
 .metric-val{font-family:monospace;color:#8bd450;font-size:20px;font-weight:600}
 .metric-val.big2{font-size:28px;line-height:1.1}
 .metric-sub{color:#666;font-size:11px;margin-top:4px}
+.timeline{max-height:480px;overflow-y:auto;margin:0 -6px;padding:0 6px}
+.event{display:grid;grid-template-columns:60px 70px 1fr;gap:8px;align-items:start;padding:6px 0;border-bottom:1px solid #1a1a1a;font-size:12px}
+.event:last-child{border:0}
+.ev-time{color:#666;font-family:monospace;font-size:11px}
+.ev-src{font-size:10px;text-transform:uppercase;letter-spacing:.5px;font-weight:600;padding:2px 6px;border-radius:4px;text-align:center;background:#222;color:#aaa}
+.ev-src.watchdog{background:#1a3a5a;color:#82c4ff}
+.ev-src.backup{background:#3a2a5a;color:#c9a4ff}
+.ev-src.rclone{background:#2a4a2a;color:#a4dca4}
+.ev-src.script{background:#5a3a1a;color:#ffc080}
+.ev-msg{color:#ddd;font-family:monospace;word-break:break-word;line-height:1.4}
+.ev-msg.error{color:#ff8585}
+.ev-msg.warn{color:#f0c060}
+.ev-msg.ok{color:#8bd450}
+.ev-msg.info{color:#aaa}
 .flash{animation:flash 1.2s ease-out}
 @keyframes flash{
   0%{background:rgba(139,212,80,.35);box-shadow:0 0 0 3px rgba(139,212,80,.35);color:#fff}
@@ -302,10 +408,15 @@ body.offline #offline{display:block;animation:pulse 1.5s infinite;opacity:1;filt
   <code id="last">—</code>
 </div>
 <div class="card">
-  <h2>Eventos</h2>
+  <h2>Sistema de protección — eventos</h2>
+  <div class="sub" style="margin-bottom:10px">Watchdog WiFi, servicio backup, rclone — últimos 60 eventos</div>
+  <div class="timeline" id="events"></div>
+</div>
+<div class="card">
+  <h2>Resumen rápido</h2>
   <div class="row"><span class="k">Último del script</span></div>
   <code id="script">—</code>
-  <div class="row"><span class="k">Último error</span></div>
+  <div class="row"><span class="k">Último error rclone</span></div>
   <code id="err">—</code>
   <div class="row"><span class="k">Último reset WiFi</span></div>
   <code id="wifireset">—</code>
@@ -416,6 +527,28 @@ async function tick(){
     set('script',d.last_script||'—',true);
     set('err',d.last_error||'sin errores recientes',true);
     set('wifireset',d.wifi_last_reset||'sin resets',true);
+    // Timeline
+    function timeAgo(ts){
+      const s=Math.floor(Date.now()/1000-ts);
+      if(s<60) return s+'s';
+      if(s<3600) return Math.floor(s/60)+'m';
+      if(s<86400) return Math.floor(s/3600)+'h';
+      return Math.floor(s/86400)+'d';
+    }
+    function escapeHtml(s){
+      return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+    const evs=d.events||[];
+    const evHtml=evs.map(e=>
+      '<div class="event"><div class="ev-time">'+timeAgo(e.ts)+'</div>'+
+      '<div class="ev-src '+e.src+'">'+e.src+'</div>'+
+      '<div class="ev-msg '+e.sev+'">'+escapeHtml(e.msg)+'</div></div>'
+    ).join('');
+    const evContainer=document.getElementById('events');
+    if(evContainer.dataset.sig!==String(evs.length)+(evs[0]?evs[0].ts:'')){
+      evContainer.innerHTML=evHtml||'<div style="color:#666;padding:10px">sin eventos</div>';
+      evContainer.dataset.sig=String(evs.length)+(evs[0]?evs[0].ts:'');
+    }
     document.getElementById('ts').textContent=new Date().toLocaleTimeString();
     sweepAll();
   }catch(e){
