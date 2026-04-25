@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 import http.server, socketserver, subprocess, os, time, re, json, threading
+from collections import deque
 
 LOG = "/home/pedro/respaldo-fotos-familia.log"
 DEST = "gdrive-bisvidita:Respaldo DiazSantaM 2026-04-14"
 TOTAL_GIB = 888.0
+TOTAL_BYTES = TOTAL_GIB * (1024**3)
 CACHE = {"ts": 0, "data": {}}
+# Historia: (epoch_seconds, bytes) — guardamos hasta 4h de samples (cada 20s = 720 samples)
+HIST = deque(maxlen=720)
 
 SOURCE = "/media/pedro/DiazSantaM"
 
@@ -58,10 +62,54 @@ def refresh():
         d["objects"] = j.get("count", 0)
         d["bytes"] = j.get("bytes", 0)
         d["drive_reachable"] = True
+        # Append a la historia
+        HIST.append((time.time(), d["bytes"]))
     except Exception:
         d["objects"] = CACHE["data"].get("objects", 0)
         d["bytes"] = CACHE["data"].get("bytes", 0)
         d["drive_reachable"] = False
+    # Calculo de velocidades promedio y ETA
+    def avg_speed_window(seconds):
+        now = time.time()
+        relevant = [(t, b) for (t, b) in HIST if now - t <= seconds]
+        if len(relevant) < 2:
+            return None
+        dt = relevant[-1][0] - relevant[0][0]
+        db = relevant[-1][1] - relevant[0][1]
+        if dt <= 0:
+            return None
+        return db / dt  # bytes/s
+    speed_5m = avg_speed_window(300)
+    speed_1h = avg_speed_window(3600)
+    speed_total = avg_speed_window(86400 * 30)  # toda la historia
+    d["speed_5m_bps"] = speed_5m
+    d["speed_1h_bps"] = speed_1h
+    d["speed_total_bps"] = speed_total
+    # ETA: usa el promedio mas confiable (1h si hay, sino 5m)
+    speed_eta = speed_1h if speed_1h and speed_1h > 0 else speed_5m
+    if speed_eta and speed_eta > 0:
+        remaining = max(0, TOTAL_BYTES - d["bytes"])
+        d["eta_seconds"] = int(remaining / speed_eta)
+    else:
+        d["eta_seconds"] = None
+    # Archivos por hora: contar lineas "Copied" en el log de la ultima hora
+    try:
+        cutoff = time.time() - 3600
+        n = 0
+        with open(LOG) as f:
+            for ln in f:
+                if "Copied" in ln:
+                    m = re.match(r"^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})", ln)
+                    if m:
+                        try:
+                            t = time.mktime(time.strptime(m.group(1), "%Y/%m/%d %H:%M:%S"))
+                            if t >= cutoff:
+                                n += 1
+                        except Exception:
+                            pass
+        d["files_per_hour"] = n
+    except Exception:
+        d["files_per_hour"] = CACHE["data"].get("files_per_hour", 0)
     # Estado de servicios
     d["service"] = svc_status("respaldo-fotos-familia")
     d["watchdog"] = svc_status("wifi-watchdog")
@@ -132,6 +180,11 @@ def quick_initial():
     d["net_ok"] = net_ok()
     d["wifi_last_reset"] = ""
     d["wifi_last_event"] = ""
+    d["speed_5m_bps"] = None
+    d["speed_1h_bps"] = None
+    d["speed_total_bps"] = None
+    d["eta_seconds"] = None
+    d["files_per_hour"] = 0
     for k in ("last_copied", "last_stats", "last_script", "last_error"):
         d[k] = ""
     CACHE["data"] = d
@@ -172,6 +225,12 @@ code{background:#000;padding:6px 8px;border-radius:3px;font-size:11px;word-break
 .pill.ok{color:#8bd450}
 .pill.bad{color:#e55}
 h2{font-size:14px;color:#888;margin:0 0 10px;text-transform:uppercase;letter-spacing:.5px}
+.metrics{display:grid;grid-template-columns:repeat(2,1fr);gap:14px;margin-top:8px}
+.metric{background:#0d0d0d;padding:14px;border-radius:8px;border:1px solid #2a2a2a}
+.metric-label{color:#888;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
+.metric-val{font-family:monospace;color:#8bd450;font-size:20px;font-weight:600}
+.metric-val.big2{font-size:28px;line-height:1.1}
+.metric-sub{color:#666;font-size:11px;margin-top:4px}
 .flash{animation:flash 1.2s ease-out}
 @keyframes flash{
   0%{background:rgba(139,212,80,.35);box-shadow:0 0 0 3px rgba(139,212,80,.35);color:#fff}
@@ -203,6 +262,28 @@ body.offline #offline{display:block;animation:pulse 1.5s infinite;opacity:1;filt
   <div class="big" id="pct">—</div>
   <div class="sub" id="sub">cargando…</div>
   <div class="bar"><div class="fill" id="fill" style="width:0%"></div></div>
+</div>
+<div class="card">
+  <h2>Ritmo y ETA</h2>
+  <div class="metrics">
+    <div class="metric">
+      <div class="metric-label">ETA</div>
+      <div class="metric-val big2" id="eta">—</div>
+      <div class="metric-sub" id="etadate">—</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">Velocidad última hora</div>
+      <div class="metric-val" id="sp1h">—</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">Velocidad últimos 5 min</div>
+      <div class="metric-val" id="sp5m">—</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">Archivos / hora</div>
+      <div class="metric-val" id="fph">—</div>
+    </div>
+  </div>
 </div>
 <div class="card">
   <h2>Salud del sistema</h2>
@@ -289,6 +370,30 @@ async function tick(){
     set('pct',pct.toFixed(2)+'%',true);
     set('sub',gib.toFixed(2)+' GiB de '+TOTAL.toFixed(0)+' GiB',true);
     document.getElementById('fill').style.width=pct+'%';
+    // Velocidad y ETA
+    function fmtSpeed(bps){
+      if(bps==null||bps<=0) return '—';
+      if(bps>=1024*1024) return (bps/(1024*1024)).toFixed(2)+' MiB/s';
+      if(bps>=1024) return (bps/1024).toFixed(0)+' KiB/s';
+      return bps.toFixed(0)+' B/s';
+    }
+    function fmtDuration(s){
+      if(s==null||s<=0) return '—';
+      const d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60);
+      if(d>0) return d+'d '+h+'h';
+      if(h>0) return h+'h '+m+'m';
+      return m+'m';
+    }
+    set('sp5m',fmtSpeed(d.speed_5m_bps),true);
+    set('sp1h',fmtSpeed(d.speed_1h_bps),true);
+    set('eta',fmtDuration(d.eta_seconds),true);
+    if(d.eta_seconds&&d.eta_seconds>0){
+      const end=new Date(Date.now()+d.eta_seconds*1000);
+      set('etadate','llega ~ '+end.toLocaleDateString('es',{weekday:'short',day:'numeric',month:'short'})+' '+end.toLocaleTimeString('es',{hour:'2-digit',minute:'2-digit'}),true);
+    } else {
+      set('etadate','—',false);
+    }
+    set('fph',(d.files_per_hour||0).toLocaleString(),true);
     // Salud
     function pill(id,ok,txt){
       const el=document.getElementById(id);
