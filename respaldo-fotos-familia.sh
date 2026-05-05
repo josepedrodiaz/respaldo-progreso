@@ -69,7 +69,7 @@ run_rclone() {
     --exclude '.DS_Store' \
     --drive-chunk-size 64M \
     --drive-stop-on-upload-limit \
-    --transfers 16 \
+    --transfers 4 \
     --checkers 32 \
     --log-file "$LOG" \
     --log-level INFO \
