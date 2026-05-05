@@ -40,18 +40,34 @@ get_driver() {
   basename $(readlink /sys/class/net/$iface/device/driver 2>/dev/null) 2>/dev/null
 }
 
+run_with_timeout() {
+  # uso: run_with_timeout SECS LABEL CMD...
+  local secs=$1 label=$2; shift 2
+  log "  $label: ejecutando (timeout ${secs}s)"
+  timeout --kill-after=10 "${secs}s" "$@" 2>&1 | head -5 | while read l; do log "    $l"; done
+  local rc=${PIPESTATUS[0]}
+  if [ $rc -eq 124 ]; then
+    log "  $label: TIMEOUT despues de ${secs}s, se mato el comando"
+  elif [ $rc -ne 0 ]; then
+    log "  $label: salio con codigo $rc"
+  else
+    log "  $label: OK"
+  fi
+  return $rc
+}
+
 action_lv1() {
   local iface=$(get_iface)
   log "LV1 cycle nmcli iface=$iface"
-  nmcli device disconnect "$iface" 2>&1 | head -3 | while read l; do log "  nmcli: $l"; done
+  run_with_timeout 20 "nmcli disconnect" nmcli device disconnect "$iface"
   sleep 5
-  nmcli device connect "$iface" 2>&1 | head -3 | while read l; do log "  nmcli: $l"; done
+  run_with_timeout 20 "nmcli connect" nmcli device connect "$iface"
   sleep 15
 }
 
 action_lv2() {
   log "LV2 restart NetworkManager"
-  sudo -n /bin/systemctl restart NetworkManager 2>&1 | head -3 | while read l; do log "  sudo: $l"; done
+  run_with_timeout 30 "systemctl NM" sudo -n /bin/systemctl restart NetworkManager
   sleep 30
 }
 
@@ -60,9 +76,9 @@ action_lv3() {
   local driver=$(get_driver $iface)
   log "LV3 reload driver $driver iface=$iface"
   if [ -n "$driver" ]; then
-    sudo -n /sbin/modprobe -r "$driver" 2>&1 | head -3 | while read l; do log "  modprobe -r: $l"; done
+    run_with_timeout 20 "modprobe -r" sudo -n /sbin/modprobe -r "$driver"
     sleep 3
-    sudo -n /sbin/modprobe "$driver" 2>&1 | head -3 | while read l; do log "  modprobe: $l"; done
+    run_with_timeout 20 "modprobe" sudo -n /sbin/modprobe "$driver"
     sleep 30
   else
     log "LV3 SKIP no driver detectado"
