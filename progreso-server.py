@@ -627,7 +627,7 @@ async function tick(){
     }
     const evs=d.events||[];
     const evHtml=evs.map(e=>
-      '<div class="event"><div class="ev-time">'+timeAgo(e.ts)+'</div>'+
+      '<div class="event"><div class="ev-time" data-ts="'+e.ts+'">'+timeAgo(e.ts)+'</div>'+
       '<div class="ev-src '+e.src+'">'+e.src+'</div>'+
       '<div class="ev-msg '+e.sev+'">'+escapeHtml(e.msg)+'</div></div>'
     ).join('');
@@ -642,6 +642,13 @@ async function tick(){
     markOffline();
   }
 }
+function refreshEventTimes(){
+  document.querySelectorAll('.ev-time[data-ts]').forEach(el=>{
+    const ts=parseInt(el.dataset.ts);
+    if(!isNaN(ts)) el.textContent=timeAgo(ts);
+  });
+}
+let evTimer=null;
 function start(){
   if(timer) return;
   tick();
@@ -651,11 +658,13 @@ function start(){
       document.getElementById('stale').textContent=fmtAge(Date.now()-lastOk);
     }
   },1000);
+  evTimer=setInterval(refreshEventTimes,5000);
 }
 function stop(){
   if(!timer) return;
   clearInterval(timer);timer=null;
   clearInterval(staleTimer);staleTimer=null;
+  if(evTimer){clearInterval(evTimer);evTimer=null;}
 }
 document.addEventListener('visibilitychange',()=>{
   document.hidden?stop():start();
