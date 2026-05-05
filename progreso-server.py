@@ -125,11 +125,95 @@ def parse_rclone_log_events(max_n=60):
                 pass
     return events[-max_n:]
 
-def collect_events(max_n=60):
+def parse_nm_events(max_n=60):
+    """Eventos relevantes de NetworkManager (state changes, dhcp, etc)."""
+    out = cmd(["journalctl", "-u", "NetworkManager", "-n", "200", "--no-pager", "-o", "short-unix"], 15)
+    events = []
+    for ln in out.splitlines():
+        m = re.match(r"^(\d+)(?:\.\d+)?\s+\S+\s+([^:]+):\s*(.*)$", ln)
+        if not m:
+            continue
+        epoch = int(m.group(1))
+        raw = m.group(3).strip()
+        # filtrar solo lo relevante
+        ml = raw.lower()
+        relevant = any(x in ml for x in [
+            "state change", "dhcp", "associated", "deauth", "disconnected",
+            "wifi", "wlxd", "powersave", "no secrets", "secrets exist",
+            "scan", "activation", "carrier"
+        ])
+        if not relevant:
+            continue
+        # remover prefijo de timestamp interno y nivel
+        msg = re.sub(r"^<\w+>\s*\[\d+\.\d+\]\s*", "", raw)
+        sev = "info"
+        if "error" in ml or "warn" in ml or "fail" in ml or "deauth" in ml:
+            sev = "warn"
+        if "disconnected" in ml or "unmanaged" in ml or "no secrets" in ml:
+            sev = "warn"
+        if "associated" in ml or "activated" in ml or "got ip" in ml or "address" in ml:
+            sev = "ok"
+        events.append((epoch, "nm", sev, msg[:240]))
+    return events[-max_n:]
+
+def parse_wpa_events(max_n=40):
+    out = cmd(["journalctl", "-u", "wpa_supplicant", "-n", "150", "--no-pager", "-o", "short-unix"], 15)
+    events = []
+    for ln in out.splitlines():
+        m = re.match(r"^(\d+)(?:\.\d+)?\s+\S+\s+([^:]+):\s*(.*)$", ln)
+        if not m:
+            continue
+        epoch = int(m.group(1))
+        msg = m.group(3).strip()
+        ml = msg.lower()
+        relevant = any(x in ml for x in [
+            "deauth", "disassoc", "connected", "disconnected",
+            "auth failure", "associating", "associated", "ctrl-event",
+            "trying to associate"
+        ])
+        if not relevant:
+            continue
+        sev = "info"
+        if "deauth" in ml or "disassoc" in ml or "disconnected" in ml or "failure" in ml:
+            sev = "warn"
+        if "ctrl-event-connected" in ml or "associated with" in ml:
+            sev = "ok"
+        events.append((epoch, "wpa", sev, msg[:240]))
+    return events[-max_n:]
+
+def parse_kernel_events(max_n=40):
+    out = cmd(["journalctl", "-k", "-n", "300", "--no-pager", "-o", "short-unix"], 15)
+    events = []
+    for ln in out.splitlines():
+        m = re.match(r"^(\d+)(?:\.\d+)?\s+\S+\s+kernel:\s*(.*)$", ln)
+        if not m:
+            continue
+        epoch = int(m.group(1))
+        msg = m.group(2).strip()
+        ml = msg.lower()
+        # solo eventos USB del bus, wifi driver, suspend/resume
+        relevant = any(x in ml for x in [
+            "wlxd0df", "r8712u", "rtl81", "usb 1-1", "usb 2-1",
+            "suspend", "resume", "disabled by hub", "emi"
+        ])
+        if not relevant:
+            continue
+        sev = "info"
+        if "disabled" in ml or "disconnect" in ml or "error" in ml or "emi" in ml:
+            sev = "warn"
+        if "new high-speed" in ml or "new low-speed" in ml or "new full-speed" in ml:
+            sev = "info"
+        events.append((epoch, "kernel", sev, msg[:240]))
+    return events[-max_n:]
+
+def collect_events(max_n=80):
     all_e = []
     all_e += parse_journal_events("wifi-watchdog", "watchdog", 80)
-    all_e += parse_journal_events("respaldo-fotos-familia", "backup", 80)
-    all_e += parse_rclone_log_events(80)
+    all_e += parse_journal_events("respaldo-fotos-familia", "backup", 60)
+    all_e += parse_rclone_log_events(60)
+    all_e += parse_nm_events(60)
+    all_e += parse_wpa_events(40)
+    all_e += parse_kernel_events(40)
     all_e.sort(key=lambda e: e[0], reverse=True)
     out = []
     for (t, src, sev, msg) in all_e[:max_n]:
@@ -332,6 +416,9 @@ h2{font-size:14px;color:#888;margin:0 0 10px;text-transform:uppercase;letter-spa
 .ev-src.backup{background:#3a2a5a;color:#c9a4ff}
 .ev-src.rclone{background:#2a4a2a;color:#a4dca4}
 .ev-src.script{background:#5a3a1a;color:#ffc080}
+.ev-src.nm{background:#5a1a4a;color:#ff80c0}
+.ev-src.wpa{background:#1a4a5a;color:#80e0e0}
+.ev-src.kernel{background:#3a3a3a;color:#cccccc}
 .ev-msg{color:#ddd;font-family:monospace;word-break:break-word;line-height:1.4}
 .ev-msg.error{color:#ff8585}
 .ev-msg.warn{color:#f0c060}

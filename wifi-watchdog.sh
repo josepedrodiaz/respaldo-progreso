@@ -7,6 +7,7 @@ set -u
 
 CHECK_INTERVAL=30
 TARGET="8.8.8.8"
+ROUTER="192.168.100.1"
 
 # Umbrales (segundos sin red)
 T_LV1=60      # 1 min: nmcli disconnect/connect
@@ -96,6 +97,26 @@ action_lv4() {
   fi
 }
 
+snapshot_diagnostico() {
+  log "=== DIAGNOSTICO AL FALLAR ==="
+  local iface=$(get_iface)
+  log "iface: $iface"
+  ping -c 1 -W 3 "$ROUTER" >/dev/null 2>&1 && \
+    log "  ping router($ROUTER): OK" || \
+    log "  ping router($ROUTER): FALLA"
+  ping -c 1 -W 3 "$TARGET" >/dev/null 2>&1 && \
+    log "  ping internet($TARGET): OK" || \
+    log "  ping internet($TARGET): FALLA"
+  log "  IP: $(ip -o -4 addr show "$iface" 2>/dev/null | awk '{print $4}' | head -1)"
+  log "  gateway: $(ip route | awk '/^default/ {print $3, $5; exit}')"
+  log "  nmcli state: $(nmcli -t -f STATE,CONNECTION device | grep "^conectado:\|^connected:" | head -1)"
+  log "  nmcli wifi: $(nmcli -t -f IN-USE,SSID,SIGNAL,CHAN device wifi 2>/dev/null | grep '^\*' | head -1)"
+  log "  wpa state: $(wpa_cli -i "$iface" status 2>/dev/null | grep -E 'wpa_state|bssid|ssid' | head -3 | tr '\n' ' ')"
+  log "  ult kernel usb/wifi (10):"
+  dmesg -T 2>/dev/null | grep -iE "usb 1-1|usb 2-1|wlxd|r8712u|wifi|wireless" | tail -10 | while read l; do log "    $l"; done
+  log "=== FIN DIAGNOSTICO ==="
+}
+
 log "watchdog arrancado (lv1=${T_LV1}s, lv2=${T_LV2}s, lv3=${T_LV3}s, lv4=${T_LV4}s, cooldown=${REBOOT_COOLDOWN}s, lv4_reset_after=${LV4_FAILED_RESET_AFTER}s)"
 
 while true; do
@@ -112,6 +133,7 @@ while true; do
     if [ $down_since -eq 0 ]; then
       down_since=$now
       log "PING falla, empezando contador"
+      snapshot_diagnostico
     fi
     elapsed=$((now - down_since))
 
