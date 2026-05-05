@@ -14,15 +14,17 @@ T_LV2=180     # 3 min: restart NetworkManager
 T_LV3=300     # 5 min: rmmod/modprobe del driver
 T_LV4=900     # 15 min: reboot (con cooldown)
 
+# Si el reboot fue intentado pero el sistema sigue vivo despues de este tiempo,
+# resetear last_action y volver a probar todos los niveles desde LV1.
+LV4_FAILED_RESET_AFTER=300  # 5 min
+
 # Cooldown de reboot: no rebootear si el ultimo fue hace menos de 1h
 REBOOT_COOLDOWN=3600
 REBOOT_STAMP="/var/lib/wifi-watchdog/last-reboot"
 
-mkdir -p "$(dirname "$REBOOT_STAMP")" 2>/dev/null || \
-  sudo -nmkdir -p "$(dirname "$REBOOT_STAMP")"
-
 down_since=0
 last_action=""
+last_action_time=0
 
 log() {
   echo "[$(date '+%H:%M:%S')] $*"
@@ -40,15 +42,15 @@ get_driver() {
 action_lv1() {
   local iface=$(get_iface)
   log "LV1 cycle nmcli iface=$iface"
-  nmcli device disconnect "$iface" 2>&1 | head -1
+  nmcli device disconnect "$iface" 2>&1 | head -3 | while read l; do log "  nmcli: $l"; done
   sleep 5
-  nmcli device connect "$iface" 2>&1 | head -1
+  nmcli device connect "$iface" 2>&1 | head -3 | while read l; do log "  nmcli: $l"; done
   sleep 15
 }
 
 action_lv2() {
   log "LV2 restart NetworkManager"
-  sudo -nsystemctl restart NetworkManager 2>&1 | head -1
+  sudo -n /bin/systemctl restart NetworkManager 2>&1 | head -3 | while read l; do log "  sudo: $l"; done
   sleep 30
 }
 
@@ -57,9 +59,9 @@ action_lv3() {
   local driver=$(get_driver $iface)
   log "LV3 reload driver $driver iface=$iface"
   if [ -n "$driver" ]; then
-    sudo -nmodprobe -r "$driver" 2>&1 | head -1
+    sudo -n /sbin/modprobe -r "$driver" 2>&1 | head -3 | while read l; do log "  modprobe -r: $l"; done
     sleep 3
-    sudo -nmodprobe "$driver" 2>&1 | head -1
+    sudo -n /sbin/modprobe "$driver" 2>&1 | head -3 | while read l; do log "  modprobe: $l"; done
     sleep 30
   else
     log "LV3 SKIP no driver detectado"
@@ -84,13 +86,17 @@ action_lv4() {
   log "LV4 considerando reboot..."
   if can_reboot; then
     log "REBOOT ahora (15+ min sin red, cooldown OK)"
-    sudo -nbash -c "echo $(date +%s) > $REBOOT_STAMP"
+    echo $(date +%s) | sudo -n /usr/bin/tee "$REBOOT_STAMP" > /dev/null
+    sync
     sleep 2
-    sudo -nreboot
+    log "ejecutando: sudo -n /bin/systemctl reboot"
+    sudo -n /bin/systemctl reboot 2>&1 | while read l; do log "  reboot: $l"; done
+    # si llegamos aca el reboot fallo
+    log "ERROR: reboot NO se ejecuto, sudo lo rechazo o systemctl fallo"
   fi
 }
 
-log "watchdog arrancado (lv1=${T_LV1}s, lv2=${T_LV2}s, lv3=${T_LV3}s, lv4=${T_LV4}s, cooldown=${REBOOT_COOLDOWN}s)"
+log "watchdog arrancado (lv1=${T_LV1}s, lv2=${T_LV2}s, lv3=${T_LV3}s, lv4=${T_LV4}s, cooldown=${REBOOT_COOLDOWN}s, lv4_reset_after=${LV4_FAILED_RESET_AFTER}s)"
 
 while true; do
   if ping -c 1 -W 5 "$TARGET" >/dev/null 2>&1; then
@@ -100,6 +106,7 @@ while true; do
     fi
     down_since=0
     last_action=""
+    last_action_time=0
   else
     now=$(date +%s)
     if [ $down_since -eq 0 ]; then
@@ -107,20 +114,33 @@ while true; do
       log "PING falla, empezando contador"
     fi
     elapsed=$((now - down_since))
+
+    # Reset si LV4 fue intentado pero el sistema sigue vivo (reboot fallo)
+    if [ "$last_action" = "lv4" ] && [ $((now - last_action_time)) -ge $LV4_FAILED_RESET_AFTER ]; then
+      log "LV4 fallo (sistema sigue vivo despues de ${LV4_FAILED_RESET_AFTER}s), reseteando escalada"
+      last_action=""
+      down_since=$now
+      elapsed=0
+    fi
+
     log "sin red hace ${elapsed}s (ult accion: ${last_action:-ninguna})"
 
     if [ $elapsed -ge $T_LV4 ] && [ "$last_action" != "lv4" ]; then
       action_lv4
       last_action="lv4"
+      last_action_time=$now
     elif [ $elapsed -ge $T_LV3 ] && [ "$last_action" != "lv3" ] && [ "$last_action" != "lv4" ]; then
       action_lv3
       last_action="lv3"
+      last_action_time=$now
     elif [ $elapsed -ge $T_LV2 ] && [ "$last_action" != "lv2" ] && [ "$last_action" != "lv3" ] && [ "$last_action" != "lv4" ]; then
       action_lv2
       last_action="lv2"
+      last_action_time=$now
     elif [ $elapsed -ge $T_LV1 ] && [ "$last_action" = "" ]; then
       action_lv1
       last_action="lv1"
+      last_action_time=$now
     fi
   fi
   sleep $CHECK_INTERVAL
