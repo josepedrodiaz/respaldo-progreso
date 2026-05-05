@@ -1,0 +1,11 @@
+[Unit]
+Description=Disparador diario del reboot preventivo a las 5 AM
+
+[Timer]
+OnCalendar=*-*-* 05:00:00
+RandomizedDelaySec=300
+Persistent=true
+Unit=preventive-reboot.service
+
+[Install]
+WantedBy=timers.target

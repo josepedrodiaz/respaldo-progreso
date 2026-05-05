@@ -1,23 +1,25 @@
 #!/bin/bash
-# Watchdog escalado de red.
-# Niveles: nmcli -> NetworkManager -> reload driver -> reboot (con cooldown)
-# Loguea TODO via journal asi se ve desde la pagina de estado.
+# Watchdog simplificado de red (2 niveles).
+# LV1 (60s):  nmcli disconnect/connect — barato, a veces alcanza
+# LV2 (180s): reboot via systemctl (con cooldown 1h, anti-loop)
+#
+# Health check real: curl HTTPS a Google API. Si falla 1 chequeo no es
+# motivo de pánico; el contador de "down_since" decide la escalada.
+# Esto detecta zombies de NetworkManager (NM "connected" pero rclone no llega)
+# que un ping ICMP simple no detectaría.
 
 set -u
 
 CHECK_INTERVAL=30
-TARGET="8.8.8.8"
+HEALTH_URL="https://www.googleapis.com/discovery/v1/apis"
 ROUTER="192.168.100.1"
 
 # Umbrales (segundos sin red)
 T_LV1=60      # 1 min: nmcli disconnect/connect
-T_LV2=180     # 3 min: restart NetworkManager
-T_LV3=300     # 5 min: rmmod/modprobe del driver
-T_LV4=900     # 15 min: reboot (con cooldown)
+T_LV2=180     # 3 min: reboot directo (con cooldown)
 
-# Si el reboot fue intentado pero el sistema sigue vivo despues de este tiempo,
-# resetear last_action y volver a probar todos los niveles desde LV1.
-LV4_FAILED_RESET_AFTER=300  # 5 min
+# Si LV2 fue intentado pero seguimos vivos despues de 5 min → reset escalada
+LV2_FAILED_RESET_AFTER=300
 
 # Cooldown de reboot: no rebootear si el ultimo fue hace menos de 1h
 REBOOT_COOLDOWN=3600
@@ -31,17 +33,7 @@ log() {
   echo "[$(date '+%H:%M:%S')] $*"
 }
 
-get_iface() {
-  ls /sys/class/net/ 2>/dev/null | grep -E '^wlx|^wlan|^wlp' | head -1
-}
-
-get_driver() {
-  local iface=$1
-  basename $(readlink /sys/class/net/$iface/device/driver 2>/dev/null) 2>/dev/null
-}
-
 run_with_timeout() {
-  # uso: run_with_timeout SECS LABEL CMD...
   local secs=$1 label=$2; shift 2
   log "  $label: ejecutando (timeout ${secs}s)"
   timeout --kill-after=10 "${secs}s" "$@" 2>&1 | head -5 | while read l; do log "    $l"; done
@@ -56,6 +48,35 @@ run_with_timeout() {
   return $rc
 }
 
+get_iface() {
+  ls /sys/class/net/ 2>/dev/null | grep -E '^wlx|^wlan|^wlp' | head -1
+}
+
+check_health() {
+  curl -sS -o /dev/null -m 5 -w '' "$HEALTH_URL" 2>/dev/null
+}
+
+snapshot_diagnostico() {
+  log "=== DIAGNOSTICO AL FALLAR ==="
+  local iface=$(get_iface)
+  log "iface: $iface"
+  ping -c 1 -W 3 "$ROUTER" >/dev/null 2>&1 && \
+    log "  ping router($ROUTER): OK" || \
+    log "  ping router($ROUTER): FALLA"
+  ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1 && \
+    log "  ping 8.8.8.8: OK" || \
+    log "  ping 8.8.8.8: FALLA"
+  curl -sS -o /dev/null -m 5 -w 'http_code=%{http_code} time=%{time_total}s' \
+    "$HEALTH_URL" 2>&1 | while read l; do log "  curl googleapis: $l"; done
+  log "  IP: $(ip -o -4 addr show "$iface" 2>/dev/null | awk '{print $4}' | head -1)"
+  log "  gateway: $(ip route | awk '/^default/ {print $3, $5; exit}')"
+  log "  nmcli state: $(nmcli -t -f STATE,CONNECTION device | grep -E '^conectado:|^connected:' | head -1)"
+  log "  nmcli wifi: $(nmcli -t -f IN-USE,SSID,SIGNAL,CHAN device wifi 2>/dev/null | grep '^\*' | head -1)"
+  log "  ult kernel usb/wifi (10):"
+  dmesg -T 2>/dev/null | grep -iE "usb 1-1|usb 2-1|wlxd|r8712u|wifi|wireless" | tail -10 | while read l; do log "    $l"; done
+  log "=== FIN DIAGNOSTICO ==="
+}
+
 action_lv1() {
   local iface=$(get_iface)
   log "LV1 cycle nmcli iface=$iface"
@@ -63,26 +84,6 @@ action_lv1() {
   sleep 5
   run_with_timeout 20 "nmcli connect" nmcli device connect "$iface"
   sleep 15
-}
-
-action_lv2() {
-  log "LV2 restart NetworkManager"
-  run_with_timeout 30 "systemctl NM" sudo -n /bin/systemctl restart NetworkManager
-  sleep 30
-}
-
-action_lv3() {
-  local iface=$(get_iface)
-  local driver=$(get_driver $iface)
-  log "LV3 reload driver $driver iface=$iface"
-  if [ -n "$driver" ]; then
-    run_with_timeout 20 "modprobe -r" sudo -n /sbin/modprobe -r "$driver"
-    sleep 3
-    run_with_timeout 20 "modprobe" sudo -n /sbin/modprobe "$driver"
-    sleep 30
-  else
-    log "LV3 SKIP no driver detectado"
-  fi
 }
 
 can_reboot() {
@@ -99,44 +100,23 @@ can_reboot() {
   return 1
 }
 
-action_lv4() {
-  log "LV4 considerando reboot..."
+action_lv2() {
+  log "LV2 considerando reboot..."
   if can_reboot; then
-    log "REBOOT ahora (15+ min sin red, cooldown OK)"
+    log "REBOOT ahora (3+ min sin red, cooldown OK)"
     echo $(date +%s) | sudo -n /usr/bin/tee "$REBOOT_STAMP" > /dev/null
     sync
     sleep 2
     log "ejecutando: sudo -n /bin/systemctl reboot"
-    sudo -n /bin/systemctl reboot 2>&1 | while read l; do log "  reboot: $l"; done
-    # si llegamos aca el reboot fallo
-    log "ERROR: reboot NO se ejecuto, sudo lo rechazo o systemctl fallo"
+    run_with_timeout 20 "reboot" sudo -n /bin/systemctl reboot
+    log "ERROR: reboot NO se ejecuto"
   fi
 }
 
-snapshot_diagnostico() {
-  log "=== DIAGNOSTICO AL FALLAR ==="
-  local iface=$(get_iface)
-  log "iface: $iface"
-  ping -c 1 -W 3 "$ROUTER" >/dev/null 2>&1 && \
-    log "  ping router($ROUTER): OK" || \
-    log "  ping router($ROUTER): FALLA"
-  ping -c 1 -W 3 "$TARGET" >/dev/null 2>&1 && \
-    log "  ping internet($TARGET): OK" || \
-    log "  ping internet($TARGET): FALLA"
-  log "  IP: $(ip -o -4 addr show "$iface" 2>/dev/null | awk '{print $4}' | head -1)"
-  log "  gateway: $(ip route | awk '/^default/ {print $3, $5; exit}')"
-  log "  nmcli state: $(nmcli -t -f STATE,CONNECTION device | grep "^conectado:\|^connected:" | head -1)"
-  log "  nmcli wifi: $(nmcli -t -f IN-USE,SSID,SIGNAL,CHAN device wifi 2>/dev/null | grep '^\*' | head -1)"
-  log "  wpa state: $(wpa_cli -i "$iface" status 2>/dev/null | grep -E 'wpa_state|bssid|ssid' | head -3 | tr '\n' ' ')"
-  log "  ult kernel usb/wifi (10):"
-  dmesg -T 2>/dev/null | grep -iE "usb 1-1|usb 2-1|wlxd|r8712u|wifi|wireless" | tail -10 | while read l; do log "    $l"; done
-  log "=== FIN DIAGNOSTICO ==="
-}
-
-log "watchdog arrancado (lv1=${T_LV1}s, lv2=${T_LV2}s, lv3=${T_LV3}s, lv4=${T_LV4}s, cooldown=${REBOOT_COOLDOWN}s, lv4_reset_after=${LV4_FAILED_RESET_AFTER}s)"
+log "watchdog arrancado (lv1=${T_LV1}s, lv2=${T_LV2}s, cooldown=${REBOOT_COOLDOWN}s, health=$HEALTH_URL)"
 
 while true; do
-  if ping -c 1 -W 5 "$TARGET" >/dev/null 2>&1; then
+  if check_health; then
     if [ $down_since -gt 0 ]; then
       now=$(date +%s)
       log "red OK despues de $((now-down_since))s caida"
@@ -148,14 +128,14 @@ while true; do
     now=$(date +%s)
     if [ $down_since -eq 0 ]; then
       down_since=$now
-      log "PING falla, empezando contador"
+      log "HEALTH falla, empezando contador"
       snapshot_diagnostico
     fi
     elapsed=$((now - down_since))
 
-    # Reset si LV4 fue intentado pero el sistema sigue vivo (reboot fallo)
-    if [ "$last_action" = "lv4" ] && [ $((now - last_action_time)) -ge $LV4_FAILED_RESET_AFTER ]; then
-      log "LV4 fallo (sistema sigue vivo despues de ${LV4_FAILED_RESET_AFTER}s), reseteando escalada"
+    # Reset si LV2 fue intentado pero el sistema sigue vivo (reboot fallo)
+    if [ "$last_action" = "lv2" ] && [ $((now - last_action_time)) -ge $LV2_FAILED_RESET_AFTER ]; then
+      log "LV2 fallo (sistema sigue vivo despues de ${LV2_FAILED_RESET_AFTER}s), reseteando escalada"
       last_action=""
       down_since=$now
       elapsed=0
@@ -163,15 +143,7 @@ while true; do
 
     log "sin red hace ${elapsed}s (ult accion: ${last_action:-ninguna})"
 
-    if [ $elapsed -ge $T_LV4 ] && [ "$last_action" != "lv4" ]; then
-      action_lv4
-      last_action="lv4"
-      last_action_time=$now
-    elif [ $elapsed -ge $T_LV3 ] && [ "$last_action" != "lv3" ] && [ "$last_action" != "lv4" ]; then
-      action_lv3
-      last_action="lv3"
-      last_action_time=$now
-    elif [ $elapsed -ge $T_LV2 ] && [ "$last_action" != "lv2" ] && [ "$last_action" != "lv3" ] && [ "$last_action" != "lv4" ]; then
+    if [ $elapsed -ge $T_LV2 ] && [ "$last_action" != "lv2" ]; then
       action_lv2
       last_action="lv2"
       last_action_time=$now

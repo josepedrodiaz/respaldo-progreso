@@ -7,8 +7,11 @@ DEST = "gdrive-bisvidita:Respaldo DiazSantaM 2026-04-14"
 TOTAL_GIB = 888.0
 TOTAL_BYTES = TOTAL_GIB * (1024**3)
 CACHE = {"ts": 0, "data": {}}
-# Historia: (epoch_seconds, bytes) — guardamos hasta 4h de samples (cada 20s = 720 samples)
+# Historia de progreso: (epoch_seconds, bytes) — hasta 4h (cada 20s = 720 samples)
 HIST = deque(maxlen=720)
+# Historia de salud: (epoch_seconds, health_ok, drive_reachable, speed_5m_bps)
+# Hasta 6h (cada 20s = 1080 samples)
+HEALTH_HIST = deque(maxlen=1080)
 
 SOURCE = "/media/pedro/DiazSantaM"
 
@@ -38,6 +41,17 @@ def net_ok():
     r = subprocess.run(["ping", "-c", "1", "-W", "3", "8.8.8.8"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return r.returncode == 0
+
+def health_ok():
+    """Mismo health check que el watchdog: HTTPS real a Google API."""
+    try:
+        r = subprocess.run(
+            ["curl", "-sS", "-o", "/dev/null", "-m", "5",
+             "https://www.googleapis.com/discovery/v1/apis"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+        return r.returncode == 0
+    except Exception:
+        return False
 
 def wifi_watchdog_last():
     out = cmd(["journalctl", "-u", "wifi-watchdog", "-n", "40", "--no-pager", "-o", "short-iso"], timeout=10)
@@ -255,6 +269,17 @@ def refresh():
     d["speed_5m_bps"] = speed_5m
     d["speed_1h_bps"] = speed_1h
     d["speed_total_bps"] = speed_total
+    # Sample de salud para la grafica
+    h_ok = health_ok()
+    d["health_ok"] = h_ok
+    HEALTH_HIST.append((time.time(), 1 if h_ok else 0, 1 if d["drive_reachable"] else 0, speed_5m or 0))
+    # Tasa de exito del health check en la ultima hora
+    cutoff = time.time() - 3600
+    recent = [s for s in HEALTH_HIST if s[0] >= cutoff]
+    if recent:
+        d["health_uptime_pct_1h"] = round(100.0 * sum(s[1] for s in recent) / len(recent), 1)
+    else:
+        d["health_uptime_pct_1h"] = None
     # ETA: usa el promedio mas confiable (1h si hay, sino 5m)
     speed_eta = speed_1h if speed_1h and speed_1h > 0 else speed_5m
     if speed_eta and speed_eta > 0:
@@ -495,6 +520,12 @@ body.offline #offline{display:block;animation:pulse 1.5s infinite;opacity:1;filt
   <code id="last">—</code>
 </div>
 <div class="card">
+  <h2>Salud histórica (últimas 6 horas)</h2>
+  <div class="sub" style="margin-bottom:10px">Verde: HTTPS a Google API responde · Rojo: down · Línea azul: KiB/s upload</div>
+  <svg id="chart" viewBox="0 0 720 160" preserveAspectRatio="none" style="width:100%;height:180px;background:#0a0a0a;border-radius:6px"></svg>
+  <div class="row" style="margin-top:10px"><span class="k">Uptime última hora</span><span class="v" id="uptime1h">—</span></div>
+</div>
+<div class="card">
   <h2>Sistema de protección — eventos</h2>
   <div class="sub" style="margin-bottom:10px">Watchdog WiFi, servicio backup, rclone — últimos 60 eventos</div>
   <div class="timeline" id="events"></div>
@@ -592,6 +623,10 @@ async function tick(){
       set('etadate','—',false);
     }
     set('fph',(d.files_per_hour||0).toLocaleString(),true);
+    if(d.health_uptime_pct_1h!=null){
+      set('uptime1h',d.health_uptime_pct_1h.toFixed(1)+'%',true);
+    }
+    drawChart();
     // Salud
     function pill(id,ok,txt){
       const el=document.getElementById(id);
@@ -642,6 +677,41 @@ async function tick(){
     markOffline();
   }
 }
+async function drawChart(){
+  try{
+    const r=await fetch('/api/health-history',{cache:'no-store'});
+    const data=await r.json();
+    if(!data.length) return;
+    const W=720,H=160,PAD=4;
+    const tMin=data[0].ts, tMax=data[data.length-1].ts;
+    const tSpan=Math.max(tMax-tMin,1);
+    const spdMax=Math.max(1,...data.map(d=>d.spd));
+    const xOf=t=>PAD+(t-tMin)/tSpan*(W-2*PAD);
+    // Bandas de salud (rojo donde health=0, sin nada donde health=1)
+    let bands='',inFail=false,failStart=0;
+    data.forEach((d,i)=>{
+      if(d.health===0 && !inFail){inFail=true;failStart=d.ts;}
+      else if(d.health===1 && inFail){
+        bands+='<rect x="'+xOf(failStart)+'" y="0" width="'+(xOf(d.ts)-xOf(failStart))+'" height="'+H+'" fill="#5a1818" opacity="0.5"/>';
+        inFail=false;
+      }
+    });
+    if(inFail) bands+='<rect x="'+xOf(failStart)+'" y="0" width="'+(xOf(tMax)-xOf(failStart))+'" height="'+H+'" fill="#5a1818" opacity="0.5"/>';
+    // Linea verde de baseline (health=1) — punteada arriba
+    bands+='<line x1="'+PAD+'" y1="20" x2="'+(W-PAD)+'" y2="20" stroke="#2a3a2a" stroke-dasharray="2 4" stroke-width="1"/>';
+    // Curva de velocidad (azul)
+    const yOf=v=>H-PAD-v/spdMax*(H-2*PAD-30);
+    const points=data.map(d=>xOf(d.ts)+','+yOf(d.spd)).join(' ');
+    const path='<polyline points="'+points+'" fill="none" stroke="#4a9eff" stroke-width="1.5"/>';
+    // Etiquetas tiempo
+    const labelStart=new Date(tMin*1000).toLocaleTimeString('es',{hour:'2-digit',minute:'2-digit'});
+    const labelEnd=new Date(tMax*1000).toLocaleTimeString('es',{hour:'2-digit',minute:'2-digit'});
+    const labels='<text x="'+PAD+'" y="14" fill="#666" font-size="10" font-family="monospace">'+labelStart+'</text>'+
+                 '<text x="'+(W-PAD)+'" y="14" fill="#666" font-size="10" font-family="monospace" text-anchor="end">'+labelEnd+'</text>'+
+                 '<text x="'+PAD+'" y="'+(H-4)+'" fill="#888" font-size="10" font-family="monospace">max '+(spdMax/1024).toFixed(0)+' KiB/s</text>';
+    document.getElementById('chart').innerHTML=bands+path+labels;
+  }catch(e){}
+}
 function refreshEventTimes(){
   document.querySelectorAll('.ev-time[data-ts]').forEach(el=>{
     const ts=parseInt(el.dataset.ts);
@@ -686,6 +756,15 @@ class H(http.server.BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(json.dumps(CACHE["data"]).encode())
+            return
+        if self.path == "/api/health-history":
+            samples = [{"ts": int(t), "health": h, "drive": dr, "spd": sp}
+                       for (t, h, dr, sp) in HEALTH_HIST]
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(json.dumps(samples).encode())
             return
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")

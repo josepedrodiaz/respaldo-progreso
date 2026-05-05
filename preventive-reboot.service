@@ -1,0 +1,9 @@
+[Unit]
+Description=Reboot preventivo diario para limpiar firmware del dongle WiFi
+
+[Service]
+Type=oneshot
+User=pedro
+ExecStart=/home/pedro/preventive-reboot.sh
+StandardOutput=journal
+StandardError=journal
