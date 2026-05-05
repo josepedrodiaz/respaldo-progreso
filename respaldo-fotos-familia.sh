@@ -78,7 +78,7 @@ run_rclone() {
     --retries 10 \
     --retries-sleep 30s \
     --low-level-retries 20 \
-    --bwlimit "08:00,400K 23:30,off"
+    --bwlimit "08:00,400K 23:30,1500K"
   return $?
 }
 
